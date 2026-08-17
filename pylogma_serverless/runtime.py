@@ -20,9 +20,15 @@ implementation using the thread/queue equivalents of the same design:
                                     queue.get(timeout=...), since stdlib
                                     Queue has no wait-for-any-of primitive
                                     (see _select_get below)
-    context.Context cancellation -> threading.Event (a stop signal) +
-                                    pubsub.close() to unblock a thread
-                                    parked in pubsub.listen()
+    context.Context cancellation -> threading.Event (a stop signal),
+                                    propagated to redis-py's own
+                                    pubsub.run_in_thread() worker via its
+                                    PubSubWorkerThread.stop() (safe to
+                                    call cross-thread -- see Subscription
+                                    and _subscription_worker below)
+    pubsub.Channel() (Go)        -> pubsub.run_in_thread(sleep_time=...),
+                                    dispatching to a per-channel handler
+                                    instead of a hand-rolled read loop
     atomic.Int32 (state)        -> plain attribute guarded by a
                                     threading.Lock (unlike the asyncio
                                     version, a Flask/gunicorn worker can
@@ -50,7 +56,6 @@ import logging
 import os
 import queue
 import threading
-import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Optional
@@ -76,10 +81,39 @@ RECONNECT_MIN_DELAY = 0.5  # seconds
 RECONNECT_MAX_DELAY = 30.0  # seconds
 REDIS_OPERATION_TIMEOUT = 10.0  # seconds
 
-# How often the actor loop's poll-based "select" and the subscription
-# workers' stop-check wake up. Small enough that shutdown/cancel feel
-# immediate; large enough not to spin the CPU.
+# How often the actor loop's poll-based "select" over the in-process
+# input/status queues wakes up, and the timeout used by the bounded-retry
+# queue.put() backpressure loops (_handle_publish, the subscription
+# worker's message-forward loop). This is purely in-process queue
+# polling -- queue.Queue.get()/put() with a timeout block on a real
+# Condition variable, not a busy spin -- so it's cheap regardless; it has
+# nothing to do with Redis I/O (see RUN_IN_THREAD_SLEEP for that).
 POLL_INTERVAL = 0.2  # seconds
+
+# Passed to redis-py's pubsub.run_in_thread(sleep_time=...), which is
+# actually the *timeout* on the underlying pubsub.get_message() call the
+# library's worker thread makes each iteration (verified against
+# redis-py 5.2.1's PubSubWorkerThread.run() -- despite the "sleep_time"
+# name, it is not a time.sleep() between iterations). Like POLL_INTERVAL,
+# a blocking socket read with a timeout costs ~nothing while idle -- but
+# each expiry still re-enters Python. On a minimum-spec Cloud Functions
+# Gen 1 instance (small/shared vCPU, cost-sensitive), a small sleep_time
+# (the commonly-cited 0.001-0.01s) means hundreds of needless wakeups/sec
+# per subscribed channel for no benefit: this branch has no SSE/real-time
+# delivery target (see README), so a message sitting for up to a second
+# before being read off the socket is invisible to any consumer. Kept
+# generous; shutdown latency is unaffected by this value since
+# Runtime._stop_all() stops each PubSubWorkerThread directly rather than
+# waiting for its sleep_time to elapse (see _subscription_worker).
+RUN_IN_THREAD_SLEEP = 1.0  # seconds
+
+# How often each subscription's supervisor thread wakes to check whether
+# its PubSubWorkerThread died from an unrecoverable error (as opposed to
+# being told to stop). This does not gate shutdown latency -- an external
+# stop_event.set() wakes the supervisor's stop_event.wait() immediately,
+# with no polling -- it only bounds how quickly a self-healing reconnect
+# kicks in after an unexpected failure, an already-rare path.
+RUN_IN_THREAD_SUPERVISOR_INTERVAL = 1.0  # seconds
 
 _CONTROL_CHANNELS = frozenset({CONTROL_ADD_CHANNEL, CONTROL_SHUTDOWN_CHANNEL})
 
@@ -152,25 +186,30 @@ def _select_get(*queues: "queue.Queue", stop_event: threading.Event):
 
 
 class Subscription:
-    """Owns one Redis channel's worker thread plus its own stop signal,
-    analogous to Go's `*subscription` (a per-channel context.CancelFunc +
-    goroutine).
+    """Owns one Redis channel's supervisor thread plus its own stop
+    signal, analogous to Go's `*subscription` (a per-channel
+    context.CancelFunc + goroutine).
 
-    Note there is no reference to the worker's live PubSub object here:
-    redis-py's PubSub is not safe to call `.close()` on from a thread
-    other than the one that's blocked reading from it (doing so races
-    the connection teardown against an in-flight socket read). So
-    cancellation is cooperative only -- stop_event is the only thing
-    touched cross-thread; the worker itself is responsible for noticing
-    it and closing its own PubSub (see Runtime._subscription_worker).
+    `run_thread` holds the live `PubSubWorkerThread` redis-py's
+    `pubsub.run_in_thread()` returns, once the supervisor thread has
+    successfully subscribed (None until then, and again after a
+    reconnect drops it). Calling `.stop()` on it cross-thread is safe --
+    unlike calling `.close()` on the underlying PubSub directly, which
+    would race an in-flight socket read on the thread that owns it,
+    `PubSubWorkerThread.stop()` only clears a `threading.Event`; the
+    actual `pubsub.close()` still happens from inside that thread's own
+    `run()` once it notices. This is what lets `Runtime._stop_all()`
+    trigger shutdown immediately instead of waiting for a poll to notice
+    stop_event.
     """
 
-    __slots__ = ("channel", "thread", "stop_event")
+    __slots__ = ("channel", "thread", "stop_event", "run_thread")
 
     def __init__(self, channel: str, thread: threading.Thread, stop_event: threading.Event):
         self.channel = channel
         self.thread = thread
         self.stop_event = stop_event
+        self.run_thread: Optional[Any] = None
 
 
 class Runtime:
@@ -364,44 +403,72 @@ class Runtime:
         if channel in self._subscriptions:
             return
         stop_event = threading.Event()
+        sub = Subscription(channel=channel, thread=None, stop_event=stop_event)  # type: ignore[arg-type]
         thread = threading.Thread(
             target=self._subscription_worker,
-            args=(channel, stop_event),
+            args=(channel, stop_event, sub),
             name=f"pylogma-sub-{channel}",
             daemon=True,
         )
-        self._subscriptions[channel] = Subscription(channel=channel, thread=thread, stop_event=stop_event)
+        sub.thread = thread
+        self._subscriptions[channel] = sub
         thread.start()
 
     def _stop_all(self) -> None:
         subs = list(self._subscriptions.values())
         for sub in subs:
             sub.stop_event.set()
+            # Trigger the running PubSubWorkerThread's own stop path
+            # directly rather than waiting for the supervisor thread's
+            # RUN_IN_THREAD_SUPERVISOR_INTERVAL poll to notice
+            # stop_event -- see Subscription's docstring for why this is
+            # safe to call cross-thread (it isn't touching the socket).
+            if sub.run_thread is not None:
+                sub.run_thread.stop()
         for sub in subs:
             sub.thread.join(timeout=REDIS_OPERATION_TIMEOUT)
         self._subscriptions.clear()
 
-    def _subscription_worker(self, channel: str, stop_event: threading.Event) -> None:
-        """Analogous to Go's subscriptionWorker: (re)subscribes with
-        exponential backoff on error, and forwards every message it
-        receives onto self.input until stop_event fires.
+    def _make_message_handler(self, channel: str, stop_event: threading.Event):
+        """Builds the per-channel callback passed to pubsub.subscribe();
+        redis-py's PubSubWorkerThread invokes this synchronously from
+        its own read loop for every 'message'-type event on `channel`
+        (subscribe/unsubscribe confirmations are already filtered out by
+        its hardcoded ignore_subscribe_messages=True).
+        """
 
-        Uses `pubsub.get_message(timeout=...)` rather than
-        `pubsub.listen()` (which blocks indefinitely on the socket) so
-        this thread wakes up on its own, at POLL_INTERVAL cadence, to
-        check stop_event -- the sync equivalent of the asyncio branch's
-        `select { case <-pubsub.Channel(): case <-ctx.Done(): }`. This
-        also means the PubSub object is only ever touched by the thread
-        that owns it: no other thread calls .close() on it, which
-        avoids racing an in-flight socket read against connection
-        teardown.
+        def handler(message: dict) -> None:
+            data = message["data"]
+            if isinstance(data, bytes):
+                data = data.decode("utf-8", errors="replace")
+            while not stop_event.is_set():
+                try:
+                    self.input.put(RuntimeMessage(channel=channel, payload=data), timeout=POLL_INTERVAL)
+                    return
+                except queue.Full:
+                    continue
+
+        return handler
+
+    def _subscription_worker(
+        self, channel: str, stop_event: threading.Event, sub: Subscription
+    ) -> None:
+        """Analogous to Go's subscriptionWorker: (re)subscribes with
+        exponential backoff on error, then hands the message-reading
+        loop to redis-py's own pubsub.run_in_thread() rather than
+        polling get_message() by hand. This thread becomes a
+        *supervisor*: it starts the library's worker thread, blocks
+        (via a real, non-polling Event wait) until either stop_event
+        fires externally or the worker thread reports it died, and
+        either way tears down and, if the runtime isn't stopping,
+        reconnects.
         """
         delay = RECONNECT_MIN_DELAY
         try:
             while not stop_event.is_set():
                 pubsub = self.client.pubsub()
                 try:
-                    pubsub.subscribe(channel)
+                    pubsub.subscribe(**{channel: self._make_message_handler(channel, stop_event)})
                 except RedisError as exc:
                     pubsub.close()
                     logger.warning(
@@ -413,41 +480,39 @@ class Runtime:
                     continue
 
                 delay = RECONNECT_MIN_DELAY
+                died = threading.Event()
+
+                def exception_handler(exc, _pubsub, thread, _channel=channel, _died=died):
+                    if not stop_event.is_set():
+                        logger.warning("run_in_thread(%s) failed: %s; reconnecting", _channel, exc)
+                    thread.stop()
+                    _died.set()
+
+                sub.run_thread = pubsub.run_in_thread(
+                    sleep_time=RUN_IN_THREAD_SLEEP,
+                    daemon=True,
+                    exception_handler=exception_handler,
+                )
                 try:
-                    while not stop_event.is_set():
-                        try:
-                            message = pubsub.get_message(
-                                ignore_subscribe_messages=True, timeout=POLL_INTERVAL
-                            )
-                        except RedisError as exc:
-                            if not stop_event.is_set():
-                                logger.warning(
-                                    "get_message(%s) failed: %s; reconnecting", channel, exc
-                                )
-                            break
-                        if message is None:
-                            continue
-                        data = message["data"]
-                        if isinstance(data, bytes):
-                            data = data.decode("utf-8", errors="replace")
-                        while not stop_event.is_set():
-                            try:
-                                self.input.put(
-                                    RuntimeMessage(channel=channel, payload=data),
-                                    timeout=POLL_INTERVAL,
-                                )
-                                break
-                            except queue.Full:
-                                continue
+                    # A real blocking wait (Condition-backed, not a
+                    # spin): returns immediately the moment stop_event
+                    # is set from any thread (e.g. Runtime._stop_all()),
+                    # with zero polling overhead. The timeout only
+                    # exists to periodically notice `died`, which can't
+                    # itself be waited on together with stop_event
+                    # (stdlib threading has no wait-on-multiple-events).
+                    while not stop_event.is_set() and not died.is_set():
+                        stop_event.wait(timeout=RUN_IN_THREAD_SUPERVISOR_INTERVAL)
                 finally:
-                    pubsub.close()
+                    sub.run_thread.stop()
+                    sub.run_thread.join(timeout=REDIS_OPERATION_TIMEOUT)
+                    sub.run_thread = None
 
                 if stop_event.is_set():
                     return
-                # get_message() broke out of its loop due to a RedisError
-                # rather than stop_event -- the connection was lost;
-                # reconnect after a short backoff, mirroring the Go
-                # worker's outer retry loop.
+                # died fired rather than stop_event -- the connection
+                # was lost; reconnect after a short backoff, mirroring
+                # the Go worker's outer retry loop.
                 if stop_event.wait(timeout=RECONNECT_MIN_DELAY):
                     return
         finally:

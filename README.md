@@ -58,17 +58,50 @@ tests/                            -- unit tests for the control-message handlers
 | `context.Context` cancellation / `asyncio.Event`    | `threading.Event`, checked cooperatively -- see below   |
 | `atomic.Int32` (state) / plain attribute            | plain attribute guarded by a real `threading.Lock` (a Flask/gunicorn worker can genuinely serve overlapping requests on separate threads, unlike a single-threaded asyncio event loop) |
 | `sync.Once` / plain boolean flag                    | boolean flag guarded by a `threading.Lock`               |
-| `redis.asyncio.Redis` + `pubsub.listen()`           | sync `redis.Redis` + `pubsub.get_message(timeout=...)` polled in a loop |
+| `redis.asyncio.Redis` + `pubsub.listen()`           | sync `redis.Redis` + `pubsub.run_in_thread(sleep_time=...)`, dispatching to a per-channel handler |
 
-`pubsub.get_message(timeout=POLL_INTERVAL)` is used instead of
-`pubsub.listen()` deliberately: `listen()` blocks indefinitely on the
-socket, and cancelling that from another thread by calling
-`pubsub.close()` cross-thread races the connection teardown against an
-in-flight socket read (this was tried first and reliably produced
-`AttributeError`/`ConnectionError` noise under load). `get_message` with
-a timeout lets each subscription's own thread wake up on its own,
-`POLL_INTERVAL` (0.2s) at a time, to check its `stop_event` -- so a
-`PubSub` object is only ever touched by the one thread that owns it.
+Each subscription's `_subscription_worker` is a *supervisor* thread: it
+subscribes with a handler (`pubsub.subscribe(**{channel: handler})`) and
+hands the actual read loop to redis-py's own `pubsub.run_in_thread()`,
+which runs a `PubSubWorkerThread` that calls
+`get_message(timeout=RUN_IN_THREAD_SLEEP)` in a loop and invokes the
+handler for each message. The supervisor then just waits (via a real,
+non-polling `threading.Event.wait()`) for either an external
+`stop_event` or a `died` flag the handler's paired `exception_handler`
+sets if the worker thread hits an unrecoverable error, and reconnects or
+returns accordingly.
+
+This replaced an earlier hand-rolled `get_message(timeout=POLL_INTERVAL)`
+poll loop for two reasons. First, correctness: an even earlier version
+used `pubsub.listen()` (blocks indefinitely on the socket) and cancelled
+it by calling `pubsub.close()` from a different thread, which reliably
+raced the connection teardown against an in-flight socket read
+(`AttributeError`/`ConnectionError` noise seen under live testing).
+Second, once on `get_message`-based polling, shutdown was still bounded
+by however long that poll's timeout was. `PubSubWorkerThread.stop()`
+(verified against redis-py 5.2.1's source) only clears a
+`threading.Event` -- it never touches the socket itself, so it's safe to
+call cross-thread -- which lets `Runtime._stop_all()` trigger shutdown on
+every subscription **immediately** rather than waiting out a poll
+interval; live-tested shutdown latency (control:shutdown publish to
+`/run`'s HTTP response) came out around 25ms.
+
+`RUN_IN_THREAD_SLEEP` (1.0s) is redis-py's `sleep_time` parameter, which
+-- despite the name, and despite what redis-py's own docs describe --
+is not a `time.sleep()` between iterations in the installed version; it's
+passed straight through as `get_message()`'s `timeout`, the same
+blocking-socket-read-with-a-timeout mechanism the removed poll loop used
+(confirmed by reading `redis/client.py`'s `PubSubWorkerThread.run()`
+directly rather than trusting the docs). A blocking read with a timeout
+costs ~nothing while idle and doesn't delay message receipt (the socket
+wakes up as soon as data arrives, regardless of the timeout ceiling) --
+but every timeout *expiry* still re-enters Python. This runs on a
+minimum-spec Cloud Functions Gen 1 instance (small/shared vCPU,
+cost-sensitive), and this branch has no SSE/real-time delivery target
+(see below) that would need sub-second polling, so `RUN_IN_THREAD_SLEEP`
+is set generously rather than to the commonly-cited 0.001-0.01s -- that
+would just be hundreds of needless wakeups/sec per subscribed channel
+for no visible benefit here.
 
 The single-actor ownership discipline from the Go version is preserved:
 `Runtime._subscriptions` is only ever read or mutated from inside
@@ -85,7 +118,7 @@ async branch -- none of it was async-specific.
 ```
 Redis
   |
-  |  pubsub.get_message(timeout=0.2s), polled per channel (subscription worker threads)
+  |  pubsub.run_in_thread(sleep_time=1.0s), per channel (subscription supervisor + worker threads)
   v
 self.input (queue.Queue, maxsize=64)
   |
@@ -155,10 +188,12 @@ CONTROL_ADD_CHANNEL      = "control:add"
 CONTROL_SHUTDOWN_CHANNEL = "control:shutdown"
 INPUT_BUFFER_SIZE        = 64
 EVENT_BUFFER_SIZE        = 64
-RECONNECT_MIN_DELAY      = 0.5s
-RECONNECT_MAX_DELAY      = 30s
-REDIS_OPERATION_TIMEOUT  = 10s
-POLL_INTERVAL            = 0.2s   -- new on this branch; see design mapping above
+RECONNECT_MIN_DELAY             = 0.5s
+RECONNECT_MAX_DELAY             = 30s
+REDIS_OPERATION_TIMEOUT         = 10s
+POLL_INTERVAL                   = 0.2s   -- in-process queue polling only, not Redis I/O
+RUN_IN_THREAD_SLEEP             = 1.0s   -- redis-py's pubsub.run_in_thread() get_message() timeout
+RUN_IN_THREAD_SUPERVISOR_INTERVAL = 1.0s -- bounds self-healing-reconnect latency only, not shutdown latency
 ```
 
 ## Routes
