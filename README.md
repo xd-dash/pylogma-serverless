@@ -1,116 +1,131 @@
-# pylogma-serverless
+# pylogma-serverless (Gen 1 branch)
 
-Python/asyncio port of [xd-dash/logma-serverless](https://github.com/xd-dash/logma-serverless)'s
+Threaded/synchronous port of [xd-dash/logma-serverless](https://github.com/xd-dash/logma-serverless)'s
 Go `router` package: a single-request, instance-local, bounded-lifetime
-Redis Pub/Sub runtime, exposed over Server-Sent Events (SSE).
+Redis Pub/Sub runtime. This branch targets **Google Cloud Functions
+Gen 1**, dispatched through [dash-xd/pyspace-minimal](https://github.com/dash-xd/pyspace-minimal)'s
+`CloudFunctionApp` (Flask + `functions-framework`, routes hot-loaded from
+a `ROUTER_MODULE`).
 
-It is meant to be hosted inside a Cloud Run / Cloud Functions Gen 2 HTTP
-service pinned to `--concurrency=1`. The HTTP request that starts the
-runtime owns its entire lifetime: it establishes control-plane
-subscriptions (`control:add`, `control:shutdown`), lets Redis hot-load
-additional subscriptions into the running container, fans every
-subscribed channel's messages out as one event stream, and shuts the
-runtime down (ending the request) on a `control:shutdown` publish or
-client disconnect.
+> This repo also has an async/Starlette/SSE branch,
+> `claude/pylogma-serverless-async-zmr63w`, targeting Cloud Run / Cloud
+> Functions **Gen 2**. Read the next section before picking a branch --
+> the two are not interchangeable, because of a real platform
+> constraint, not just a style preference.
+
+## Why this branch has no SSE
+
+Cloud Functions Gen 1 runs under `functions-framework`'s **synchronous
+WSGI** Flask app. There is no ASGI, no `async def`, and critically:
+**Gen 1 does not support streaming HTTP responses** -- Google buffers the
+entire response body and sends it only once the function returns. Real
+push-based SSE (`text/event-stream`, flushed chunk by chunk as messages
+arrive) requires Gen 2 / Cloud Run.
+
+So this branch drops the async branch's `GET /events` SSE endpoint
+entirely and keeps only a **blocking `POST /run`**, matching the Go
+version's `POST /run` behavior exactly: claim a runtime, run the Redis
+actor loop synchronously until `control:shutdown` (or the platform's own
+function timeout), then return `{"status": "stopped"}`. If you need
+real-time push delivery to a browser or long-lived client, use the Gen 2
+branch instead.
 
 ## Layout
 
 ```
+main.py                          -- Gen 1 entrypoint: CloudFunctionApp(...).build() -> `main`
+router.py                        -- ROUTER_MODULE target; registers POST /run directly
+                                     on the shared Flask app (see its docstring for why
+                                     pyspace-minimal's declarative ROUTES dict alone isn't
+                                     enough here)
 pylogma_serverless/
-  runtime.py   -- the Runtime actor (equivalent of runtime.go)
-  app.py       -- Starlette app: /run, /events, API-key auth (equivalent
-                  of router.go + handlers.go)
-main.py        -- ASGI entrypoint (`uvicorn main:app`)
-tests/         -- unit tests for the control-message handlers and the
-                  claim()/RuntimeHolder state machine
+  runtime.py                     -- the Runtime actor (threaded rewrite of the Go/async version)
+  views.py                       -- run_view() (Flask view function) + X-API-Key auth check
+tests/                            -- unit tests for the control-message handlers and the
+                                     claim()/RuntimeHolder state machine
 ```
 
-## Design mapping (Go -> Python)
+## Design mapping (Go / async branch -> this branch)
 
-The write-up below is the reasoning this port follows, condensed to what
-actually landed in code:
+| Go / asyncio branch                              | This branch (threaded)                              |
+|----------------------------------------------------|--------------------------------------------------------|
+| goroutine / `asyncio.Task`                          | `threading.Thread`                                     |
+| `go foo()` / `asyncio.create_task(foo())`           | `threading.Thread(target=foo).start()`                 |
+| `chan T` / `asyncio.Queue`                          | `queue.Queue`                                           |
+| `ch <- v` / `await queue.put(v)`                    | `queue.put(v, timeout=...)`                             |
+| `<-ch` / `await queue.get()`                        | `queue.get(timeout=...)`                                |
+| `select { case a: ...; case b: ... }`               | `_select_get()` -- a short-timeout poll loop over each queue, since stdlib `queue.Queue` has no wait-for-any-of primitive |
+| `context.Context` cancellation / `asyncio.Event`    | `threading.Event`, checked cooperatively -- see below   |
+| `atomic.Int32` (state) / plain attribute            | plain attribute guarded by a real `threading.Lock` (a Flask/gunicorn worker can genuinely serve overlapping requests on separate threads, unlike a single-threaded asyncio event loop) |
+| `sync.Once` / plain boolean flag                    | boolean flag guarded by a `threading.Lock`               |
+| `redis.asyncio.Redis` + `pubsub.listen()`           | sync `redis.Redis` + `pubsub.get_message(timeout=...)` polled in a loop |
 
-| Go                                   | Python                                            |
-|---------------------------------------|----------------------------------------------------|
-| goroutine                             | `asyncio.Task`                                     |
-| `go foo()`                            | `asyncio.create_task(foo())`                       |
-| `chan T`                              | `asyncio.Queue`                                    |
-| `ch <- v`                             | `await queue.put(v)`                               |
-| `<-ch`                                | `await queue.get()`                                |
-| `select { case a: ...; case b: ... }` | `asyncio.wait({...}, return_when=FIRST_COMPLETED)` |
-| `context.Context` cancellation        | `asyncio.Event` (a stop signal) + `task.cancel()`  |
-| `context.WithTimeout`                 | `asyncio.timeout(seconds)`                         |
-| `atomic.Int32` (state)                | plain attribute -- safe because asyncio is single-threaded and `claim()` never awaits between the check and the write |
-| `sync.Once`                           | plain boolean flag, same single-threaded reasoning |
-| `redis.NewClient` + `.Subscribe`      | `redis.asyncio.Redis` + `pubsub()` / `async for message in pubsub.listen()` |
-
-`redis.asyncio` (`redis-py`'s native asyncio client) is the async Redis
-client; `pubsub.listen()` is an async generator that yields control back
-to the event loop whenever there's no message, so other tasks (other
-subscriptions, the actor loop, the HTTP handler) keep running while it
-waits -- the same "cooperative yield while blocked" property Go gets from
-a goroutine blocked on `<-ch`.
+`pubsub.get_message(timeout=POLL_INTERVAL)` is used instead of
+`pubsub.listen()` deliberately: `listen()` blocks indefinitely on the
+socket, and cancelling that from another thread by calling
+`pubsub.close()` cross-thread races the connection teardown against an
+in-flight socket read (this was tried first and reliably produced
+`AttributeError`/`ConnectionError` noise under load). `get_message` with
+a timeout lets each subscription's own thread wake up on its own,
+`POLL_INTERVAL` (0.2s) at a time, to check its `stop_event` -- so a
+`PubSub` object is only ever touched by the one thread that owns it.
 
 The single-actor ownership discipline from the Go version is preserved:
 `Runtime._subscriptions` is only ever read or mutated from inside
-`Runtime._run()` (the actor loop) -- never across an `await` from another
-coroutine -- so, exactly as in the Go version, no lock is needed to guard
-it.
+`Runtime._run()`, which runs on a single thread (the one that called
+`start()`) for the whole lifetime of that `Runtime`.
 
-### Fan-in / fan-out topology
+The control-message handling logic (`_handle_add`, `_handle_shutdown`,
+`_handle_publish`'s channel-default-override and empty-payload-drop
+rules) and the constants block are unchanged from the Go version and the
+async branch -- none of it was async-specific.
 
-Same two-hop shape as the Go version:
+### Fan-in topology
 
 ```
 Redis
   |
-  |  pubsub.listen() per channel (subscription worker tasks)
+  |  pubsub.get_message(timeout=0.2s), polled per channel (subscription worker threads)
   v
-self.input (asyncio.Queue, maxsize=64)
+self.input (queue.Queue, maxsize=64)
   |
-  |  single actor task (Runtime._run)
+  |  single actor loop (Runtime._run), running on the /run request's own thread
   v
-self.events (asyncio.Queue, maxsize=64)
-  |
-  |  SSE generator in app.events_endpoint
-  v
-HTTP response (text/event-stream)
+self.events (queue.Queue, maxsize=64)   -- populated but not drained by anything on
+                                            this branch; kept for parity/future use
 ```
 
-- One `asyncio.Task` per subscribed Redis channel (`Runtime._subscription_worker`),
-  minimum two for the mandatory control channels. Each one resubscribes
-  with exponential backoff (500ms -> 30s cap) on error, exactly like
-  `subscriptionWorker` in the Go version.
-- A single actor task (`Runtime._run`) owns the `_subscriptions` map,
-  reads off `self.input`/`self.status`, routes `control:add` /
-  `control:shutdown` messages, and forwards everything else to
-  `self.events` as a `PublishRequest`.
-- The ASGI request handler for `/events` reads `self.events` and writes
-  each one as an SSE frame (`event: message\ndata: <json>\n\n`), with a
-  15-second keepalive comment (`: keepalive\n\n`) when the stream is
-  otherwise idle -- identical cadence to the Go version's `sseKeepAlive`.
+There's no consumer draining `self.events` on this branch (no SSE
+endpoint), so it's populated by `_handle_publish` exactly like the async
+branch, using the same drop-if-shutting-down-and-full backpressure rule,
+but nothing reads it back out. If you need the accumulated events
+returned to the caller, extend `run_view` to drain `rt.events` after
+`rt.start()` returns and include them in the JSON response.
 
 ### Lifecycle / termination
 
-Exactly three ways a runtime ends, mirroring the Go version:
+Two ways this branch's runtime ends (one fewer than the Go version and
+the async branch):
 
 1. A `control:shutdown` message is published (payload `{"reason": "..."}`,
    reason is optional).
-2. The client disconnects. Starlette has no push-based disconnect event,
-   so `app._watch_disconnect` polls `request.is_disconnected()` once a
-   second and sets a stop `asyncio.Event` when it fires -- the poll-based
-   equivalent of Go's `select { case <-r.Context().Done(): ... }`.
-3. `Runtime.cancel()` is called explicitly (idempotent, safe from any
-   task, any number of times).
+2. `Runtime.cancel()` is called explicitly (idempotent, safe from any
+   thread, any number of times) -- not wired to anything by default on
+   this branch, see below.
 
-There is no idle/inactivity timeout on the runtime itself, same as the Go
-version -- session lifetime is unbounded until one of the three signals
-above fires (bounded in production by the platform's own request
-timeout).
+**Not available on this branch: client-disconnect-triggered shutdown.**
+Flask/WSGI has no live request-disconnect signal the way Starlette's
+`request.is_disconnected()` does, so if the HTTP client goes away mid
+`/run`, the runtime keeps running regardless -- it only stops via
+`control:shutdown` or the platform's own function execution timeout
+(Gen 1 HTTP functions: 540s max). This is a real behavior difference
+from both the Go version and the async branch; if you need
+disconnect-aware cancellation, that's another reason to prefer the Gen 2
+branch.
 
 ## Redis message schema
 
-Same JSON shapes as the Go version:
+Same JSON shapes as the Go version and the async branch:
 
 - `control:add` -> `{"channel": "some:channel:name"}` -- hot-loads a new
   subscription into the running container.
@@ -119,12 +134,10 @@ Same JSON shapes as the Go version:
 - Any other subscribed channel -> `{"channel": "override (optional)", "data": <any JSON>}`.
   If `channel` is omitted, the Redis channel the message physically
   arrived on is substituted. An empty payload or literal `{}` is silently
-  dropped (no SSE event emitted). Payloads that fail to parse as JSON are
-  logged and dropped, never fatal to the runtime.
+  dropped. Payloads that fail to parse as JSON are logged and dropped,
+  never fatal to the runtime.
 
 ## Config (env vars)
-
-Same names and defaults as the Go version:
 
 | Variable                      | Purpose                                                      |
 |--------------------------------|---------------------------------------------------------------|
@@ -132,9 +145,10 @@ Same names and defaults as the Go version:
 | `REDISCLI_AUTH`                 | Redis password (optional)                                    |
 | `REDIS_DEFAULT_SUBSCRIPTIONS`   | JSON array of channel names to subscribe at boot, e.g. `["a","b"]` |
 | `API_KEY`                       | Required; requests must send a matching `X-API-Key` header, compared in constant time |
+| `ROUTER_MODULE`                 | Required by pyspace-minimal's `CloudFunctionApp`; set to `router` so it imports this repo's `router.py` |
 
 Constants (`pylogma_serverless/runtime.py`), identical values to the Go
-`const` block:
+`const` block and the async branch:
 
 ```
 CONTROL_ADD_CHANNEL      = "control:add"
@@ -144,42 +158,49 @@ EVENT_BUFFER_SIZE        = 64
 RECONNECT_MIN_DELAY      = 0.5s
 RECONNECT_MAX_DELAY      = 30s
 REDIS_OPERATION_TIMEOUT  = 10s
-SSE_KEEPALIVE            = 15s
+POLL_INTERVAL            = 0.2s   -- new on this branch; see design mapping above
 ```
 
 ## Routes
 
-- `POST /run` -- claims a runtime and blocks until it stops (no SSE).
-  Returns `200 {"status": "stopped"}`, or `409` if a runtime is already
-  claimed.
-- `GET /events` -- claims a runtime, starts it in the background, and
-  streams `text/event-stream` until it stops or the client disconnects.
-  `409` if already claimed.
+- `POST /run` -- claims a runtime and blocks until it stops. Returns
+  `200 {"status": "stopped"}`, or `409` if a runtime is already claimed,
+  or `401` for a missing/incorrect `X-API-Key` header.
 
-Deliberately no `/` health-check route: with `--concurrency=1`, a health
-check would consume the container's only request slot, same reasoning as
-the Go version.
+Registered directly on the shared Flask app rather than through
+pyspace-minimal's `ROUTES` dict, because `CloudFunctionApp.register_routes()`
+calls `add_url_rule(rule, endpoint=rule, view_func=view_func)` without a
+`methods=` argument, defaulting to GET/HEAD/OPTIONS only -- see
+`router.py`'s docstring for the full explanation. No `/` health-check
+route, matching the Go version's reasoning about not wasting the
+container's request-handling slot.
 
 ## Running locally
 
+Requires Python 3.12 (pyspace-minimal's `cloud_function_app` package
+pins `requires-python = ">=3.12"`, and it's also the Gen 1 deploy
+runtime this branch targets).
+
 ```bash
-python -m venv .venv && . .venv/bin/activate
+python3.12 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 
 export API_KEY=dev-key
 export REDIS_URI=redis://localhost:6379
+export ROUTER_MODULE=router
 
-uvicorn main:app --host 0.0.0.0 --port 8080
+functions-framework --target=main --source=main.py --port 8080
 ```
 
 ```bash
-# in another shell
-curl -N -H "X-API-Key: dev-key" http://localhost:8080/events
+# in another shell -- /run blocks until control:shutdown is published
+curl -X POST -H "X-API-Key: dev-key" http://localhost:8080/run &
 
 # in a third shell
 redis-cli publish control:add '{"channel":"dev:global:logs:1"}'
 redis-cli publish dev:global:logs:1 '{"data":{"msg":"hello"}}'
 redis-cli publish control:shutdown '{"reason":"done"}'
+# the first curl now returns {"status": "stopped"}
 ```
 
 ## Tests
@@ -189,35 +210,39 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-Covers `handle_publish`'s channel-default-override and empty/`{}`-payload
-drop, `handle_add`'s dedup/validation, and `claim()`/`RuntimeHolder`'s
+Covers `_handle_publish`'s channel-default-override and empty/`{}`-payload
+drop, `_handle_add`'s dedup/validation, and `claim()`/`RuntimeHolder`'s
 compare-and-swap state machine -- ported from the Go version's
-`runtime_test.go` cases. These don't require a running Redis server since
-`Runtime`'s constructor is lazy about connecting.
+`runtime_test.go` cases, adapted to synchronous calls (no
+`pytest-asyncio` needed on this branch). These don't require a running
+Redis server since `Runtime`'s constructor is lazy about connecting.
 
 ## Deploying
 
-Cloud Run:
-
 ```bash
-gcloud run deploy pylogma-serverless \
-  --source . \
-  --concurrency=1 \
-  --set-env-vars REDIS_URI=...,REDISCLI_AUTH=...,API_KEY=...
+gcloud functions deploy pylogma-serverless \
+  --no-gen2 \
+  --runtime python312 \
+  --entry-point main \
+  --trigger-http \
+  --set-env-vars ROUTER_MODULE=router,REDIS_URI=...,REDISCLI_AUTH=...,API_KEY=...
 ```
 
-`--concurrency=1` is the Python equivalent of the Go version's
-`maxInstanceRequestConcurrency=1`: it guarantees only one HTTP request --
-and therefore only one live `Runtime` -- exists per container instance at
-a time, which is what lets `RuntimeHolder.claim()` avoid needing a lock.
+`--no-gen2` forces Gen 1, matching pyspace-minimal's own README. The
+deployed source directory needs `main.py`, `router.py`,
+`pylogma_serverless/`, and `requirements.txt` together -- pip can't reach
+into a separately-deployed package.
 
-## Known gap vs. the Go version
+## Known gaps vs. the Go version / the async branch
 
-The Go version has no panic-recovery safety net around its background
-goroutines (`subscriptionWorker`, the actor loop) -- only the HTTP
-handler chain is wrapped in `middleware.Recoverer`. This port mirrors
-that: an unexpected exception in a subscription worker is caught, logged,
-and reported to the actor (which will restart that subscription unless
-the runtime is shutting down), but an unexpected exception in the actor
-loop itself (`Runtime._run`) is not recovered from -- it propagates out of
-`Runtime.start()` to whichever task awaited it.
+- No client-disconnect cancellation (see Lifecycle/termination above).
+- No SSE / real-time event delivery (see "Why this branch has no SSE"
+  above); `Runtime.events` is populated but has no consumer wired up by
+  default.
+- Same as the Go version: no panic/exception-recovery safety net around
+  background work. An unexpected exception in a subscription worker
+  thread is caught, logged, and reported to the actor (which restarts
+  that subscription unless the runtime is shutting down); an unexpected
+  exception in the actor loop itself (`Runtime._run`) is not recovered
+  from -- it propagates out of `Runtime.start()` to the Flask request
+  thread that called it, surfacing as a 500.

@@ -1,56 +1,69 @@
 """Single-request, instance-local, bounded-lifetime Redis Pub/Sub runtime.
 
-Python/asyncio port of the Go `router` package in xd-dash/logma-serverless.
-It is meant to be hosted inside a Cloud Run / Cloud Functions Gen 2 HTTP
-service pinned to a concurrency of 1 request per container instance. The
-HTTP request that starts the runtime owns its entire lifetime: it
-establishes control-plane subscriptions (``control:add``,
-``control:shutdown``), lets Redis hot-load additional subscriptions into
-the running container, fans every subscribed channel's messages out as one
-event stream, and shuts the runtime down (ending the request) on a
-``control:shutdown`` publish or client disconnect.
+Threaded/synchronous port of the Go `router` package in
+xd-dash/logma-serverless, for hosting on Google Cloud Functions **Gen 1**
+via `functions-framework` (synchronous WSGI/Flask -- see app.py's module
+docstring for the routing side of this).
 
-Go -> Python concept mapping used throughout this module:
+Gen 1 has no ASGI, no `async def`, and no support for long-lived
+streaming HTTP responses (the platform buffers the whole response body),
+so this is not a drop-in reuse of the asyncio version in this repo's
+`claude/pylogma-serverless-async-zmr63w` branch -- it's a parallel
+implementation using the thread/queue equivalents of the same design:
 
-    goroutine                  -> asyncio.Task
-    go foo()                   -> asyncio.create_task(foo())
-    channel (chan T)           -> asyncio.Queue
-    ch <- value                -> await queue.put(value)
-    <-ch                       -> await queue.get()
-    select { case ... }        -> asyncio.wait({...}, return_when=FIRST_COMPLETED)
-                                   (see _select2 / _select3 helpers below)
-    context.Context             -> asyncio.Event (a "stop" signal) + task.cancel()
-    context.WithTimeout          -> asyncio.timeout(seconds)
-    atomic.Int32 (state)        -> plain attribute (safe: single-threaded event loop,
-                                   claim() never awaits between check and set)
-    sync.Once                   -> plain boolean flag (same single-threaded reasoning)
+    goroutine                   -> threading.Thread
+    go foo()                    -> threading.Thread(target=foo).start()
+    channel (chan T)            -> queue.Queue
+    ch <- value                 -> queue.put(value)
+    <-ch                        -> queue.get()
+    select { case ... }         -> a short-timeout poll loop over each
+                                    queue.get(timeout=...), since stdlib
+                                    Queue has no wait-for-any-of primitive
+                                    (see _select_get below)
+    context.Context cancellation -> threading.Event (a stop signal) +
+                                    pubsub.close() to unblock a thread
+                                    parked in pubsub.listen()
+    atomic.Int32 (state)        -> plain attribute guarded by a
+                                    threading.Lock (unlike the asyncio
+                                    version, a Flask/gunicorn worker can
+                                    genuinely serve overlapping requests
+                                    on separate threads, so this needs a
+                                    real lock)
+    sync.Once                   -> threading.Lock guarding a boolean flag
 
-The single-actor ownership discipline from the Go version is preserved:
-the ``_subscriptions`` dict is only ever touched from within ``run()``
-(the actor loop), so no lock is needed there either -- in asyncio this
-is guaranteed as long as that dict is never mutated across an ``await``
-boundary from another coroutine.
+The control-message handling logic (_handle_add, _handle_shutdown,
+_handle_publish's channel-default-override and empty-payload-drop rules)
+is unchanged from the asyncio version -- none of it was async-specific.
+
+Known behavior difference from both the Go version and the asyncio
+branch: Flask/WSGI has no live request-disconnect signal (unlike
+Starlette's `request.is_disconnected()`), so this runtime does not
+terminate on client disconnect. Its only termination paths are a
+`control:shutdown` publish and the platform's own function execution
+timeout (Gen 1 HTTP functions: 540s max).
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import queue
+import threading
+import time
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Optional
 
-import redis.asyncio as redis
+import redis
 from redis.exceptions import RedisError
 
 logger = logging.getLogger("pylogma_serverless.runtime")
 
 # --------------------------------------------------------------------------
-# Config constants (mirrors runtime.go's const block + handlers.go's
-# sseKeepAlive). Kept identical in value to the Go original.
+# Config constants -- identical values to the Go original and to this
+# repo's asyncio branch. SSE_KEEPALIVE is not used here (no streaming
+# endpoint on Gen 1) but is kept for reference/parity.
 # --------------------------------------------------------------------------
 
 CONTROL_ADD_CHANNEL = "control:add"
@@ -63,7 +76,10 @@ RECONNECT_MIN_DELAY = 0.5  # seconds
 RECONNECT_MAX_DELAY = 30.0  # seconds
 REDIS_OPERATION_TIMEOUT = 10.0  # seconds
 
-SSE_KEEPALIVE = 15.0  # seconds (consumed by the ASGI layer, not this module)
+# How often the actor loop's poll-based "select" and the subscription
+# workers' stop-check wake up. Small enough that shutdown/cancel feel
+# immediate; large enough not to spin the CPU.
+POLL_INTERVAL = 0.2  # seconds
 
 _CONTROL_CHANNELS = frozenset({CONTROL_ADD_CHANNEL, CONTROL_SHUTDOWN_CHANNEL})
 
@@ -75,7 +91,8 @@ class RuntimeState(IntEnum):
 
 
 # --------------------------------------------------------------------------
-# Message payload shapes (mirrors the JSON-tagged structs in runtime.go)
+# Message payload shapes (same JSON wire schema as the Go version and the
+# asyncio branch)
 # --------------------------------------------------------------------------
 
 
@@ -89,16 +106,16 @@ class RuntimeMessage:
 
 @dataclass(slots=True)
 class SubscriptionStopped:
-    """Reported worker -> actor when a per-channel subscription task ends."""
+    """Reported worker -> actor when a per-channel subscription thread ends."""
 
     channel: str
 
 
 @dataclass(slots=True)
 class PublishRequest:
-    """The payload delivered to a subscribed data channel and re-emitted as
-    an SSE event. If the message itself doesn't carry a channel, the Redis
-    channel it arrived on is substituted (see handle_publish)."""
+    """The payload produced for a subscribed data channel. If the message
+    itself doesn't carry a channel, the Redis channel it arrived on is
+    substituted (see _handle_publish)."""
 
     channel: Optional[str] = None
     data: Any = None
@@ -112,36 +129,55 @@ class PublishRequest:
         return out
 
 
-async def _select2(fut_a: "asyncio.Future", fut_b: "asyncio.Future"):
-    """select { case a; case b } for two already-scheduled awaitables.
+_SENTINEL = object()
 
-    Returns (winner_index, result_or_exception_raised). Cancels the loser.
-    Neither future is re-usable after this call.
+
+def _select_get(*queues: "queue.Queue", stop_event: threading.Event):
+    """select { case <-q1: ...; case <-q2: ...; case <-ctx.Done(): ... }
+    for stdlib queue.Queue, which has no native wait-for-any-of. Polls
+    each queue with a short non-blocking-ish timeout, returning as soon
+    as any one has an item or stop_event fires.
+
+    Returns (queue, item) for whichever queue produced first, or
+    (None, None) if stop_event fired first.
     """
-    done, pending = await asyncio.wait({fut_a, fut_b}, return_when=asyncio.FIRST_COMPLETED)
-    for fut in pending:
-        fut.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await fut
-    if fut_a in done:
-        return 0, fut_a.result()
-    return 1, fut_b.result()
+    while not stop_event.is_set():
+        for q in queues:
+            try:
+                item = q.get(timeout=POLL_INTERVAL / len(queues))
+            except queue.Empty:
+                continue
+            return q, item
+    return None, None
 
 
 class Subscription:
-    """Owns one Redis channel's worker task, analogous to Go's
-    `*subscription` (a per-channel context.CancelFunc + goroutine)."""
+    """Owns one Redis channel's worker thread plus its own stop signal,
+    analogous to Go's `*subscription` (a per-channel context.CancelFunc +
+    goroutine).
 
-    __slots__ = ("channel", "task")
+    Note there is no reference to the worker's live PubSub object here:
+    redis-py's PubSub is not safe to call `.close()` on from a thread
+    other than the one that's blocked reading from it (doing so races
+    the connection teardown against an in-flight socket read). So
+    cancellation is cooperative only -- stop_event is the only thing
+    touched cross-thread; the worker itself is responsible for noticing
+    it and closing its own PubSub (see Runtime._subscription_worker).
+    """
 
-    def __init__(self, channel: str, task: "asyncio.Task"):
+    __slots__ = ("channel", "thread", "stop_event")
+
+    def __init__(self, channel: str, thread: threading.Thread, stop_event: threading.Event):
         self.channel = channel
-        self.task = task
+        self.thread = thread
+        self.stop_event = stop_event
 
 
 class Runtime:
     """Single-use actor that owns a set of Redis subscriptions for the
-    lifetime of one HTTP request. Mirrors Go's `*Runtime`.
+    lifetime of one HTTP request. Mirrors Go's `*Runtime`, but the actor
+    loop itself runs synchronously on the calling (request) thread rather
+    than as a background task -- see start().
     """
 
     def __init__(self) -> None:
@@ -150,96 +186,65 @@ class Runtime:
         )
 
         self.state: RuntimeState = RuntimeState.IDLE
-        self._started = False  # sync.Once equivalent for start()
+        self._claim_lock = threading.Lock()
+        self._start_lock = threading.Lock()
+        self._started = False
 
-        # channels -> asyncio.Queue
-        self.input: "asyncio.Queue[RuntimeMessage]" = asyncio.Queue(maxsize=INPUT_BUFFER_SIZE)
-        self.events: "asyncio.Queue[PublishRequest]" = asyncio.Queue(maxsize=EVENT_BUFFER_SIZE)
-        self.status: "asyncio.Queue[SubscriptionStopped]" = asyncio.Queue(maxsize=INPUT_BUFFER_SIZE)
+        self.input: "queue.Queue[RuntimeMessage]" = queue.Queue(maxsize=INPUT_BUFFER_SIZE)
+        self.events: "queue.Queue[PublishRequest]" = queue.Queue(maxsize=EVENT_BUFFER_SIZE)
+        self.status: "queue.Queue[SubscriptionStopped]" = queue.Queue(maxsize=INPUT_BUFFER_SIZE)
 
-        # context.Context/CancelFunc equivalent for the whole runtime.
-        self._stop_event = asyncio.Event()
-        self.done_event = asyncio.Event()
+        self._stop_event = threading.Event()
+        self._done_event = threading.Event()
 
-        # single-actor-owned state; never mutated from another coroutine.
+        # single-actor-owned state; only ever touched from _run(), which
+        # runs on a single thread for this Runtime's whole lifetime.
         self._subscriptions: dict[str, Subscription] = {}
-
-        self._watcher_task: Optional["asyncio.Task"] = None
-        self._run_task: Optional["asyncio.Task"] = None
 
     # -- public API -------------------------------------------------------
 
     def claim(self) -> bool:
-        """CompareAndSwap(IDLE -> RUNNING). Safe without a lock: this method
-        never awaits, and asyncio only switches coroutines at an await
-        point, so no other task can interleave between the check and the
-        assignment."""
-        if self.state == RuntimeState.IDLE:
-            self.state = RuntimeState.RUNNING
-            return True
-        return False
+        """CompareAndSwap(IDLE -> RUNNING)."""
+        with self._claim_lock:
+            if self.state == RuntimeState.IDLE:
+                self.state = RuntimeState.RUNNING
+                return True
+            return False
 
     def cancel(self) -> None:
-        """Idempotent, safe to call from any task, any number of times."""
+        """Idempotent, safe to call from any thread, any number of times."""
         self._stop_event.set()
 
-    async def wait_done(self) -> None:
-        await self.done_event.wait()
+    def wait_done(self, timeout: Optional[float] = None) -> bool:
+        return self._done_event.wait(timeout=timeout)
 
-    async def start(self, external_disconnect: Optional[asyncio.Event] = None) -> None:
-        """Equivalent of Go's Start(ctx). `external_disconnect`, if given,
-        is an asyncio.Event the caller sets when the originating HTTP
-        request disconnects; a watcher task forwards that into
-        self.cancel(), exactly like Go's:
-
-            select {
-            case <-ctx.Done():
-                rt.cancel()
-            case <-rt.ctx.Done():
-            }
-
-        Guarded so a double call is a no-op, matching sync.Once.
+    def start(self) -> None:
+        """Equivalent of Go's Start(ctx), minus the ctx-forwarding watcher
+        (Flask/WSGI has no live disconnect signal to forward -- see the
+        module docstring). Runs the actor loop on the calling thread, so
+        this call blocks until the runtime stops. Guarded so a double
+        call is a no-op, matching sync.Once.
         """
-        if self._started:
-            return
-        self._started = True
-
-        if external_disconnect is not None:
-            self._watcher_task = asyncio.create_task(
-                self._forward_external_cancel(external_disconnect)
-            )
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
 
         try:
-            await self._run()
+            self._run()
         finally:
             self.state = RuntimeState.DONE
-            self.done_event.set()
-            if self._watcher_task is not None:
-                self._watcher_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self._watcher_task
+            self._done_event.set()
 
-    async def aclose_client(self) -> None:
+    def close_client(self) -> None:
         """Not called anywhere by default -- mirrors the Go version, which
-        never explicitly closes its redis.Client either. Exposed so a
-        caller that wants stricter cleanup than the original can use it.
-        """
-        await self.client.aclose()
-
-    async def _forward_external_cancel(self, external_disconnect: asyncio.Event) -> None:
-        _, _ = await _select2(
-            asyncio.ensure_future(external_disconnect.wait()),
-            asyncio.ensure_future(self._stop_event.wait()),
-        )
-        self.cancel()
+        never explicitly closes its redis.Client either."""
+        self.client.close()
 
     # -- the actor loop -----------------------------------------------------
 
-    async def _run(self) -> None:
+    def _run(self) -> None:
         try:
-            # Mandatory control-channel subscriptions first; failure here
-            # aborts the whole runtime immediately (mirrors run() lines
-            # 191-198 in runtime.go).
             try:
                 self._start_subscription(CONTROL_ADD_CHANNEL)
                 self._start_subscription(CONTROL_SHUTDOWN_CHANNEL)
@@ -247,66 +252,43 @@ class Runtime:
                 logger.exception("failed to start control-channel subscriptions")
                 return
 
-            await self._bootstrap()
+            self._bootstrap()
 
-            input_get = asyncio.ensure_future(self.input.get())
-            status_get = asyncio.ensure_future(self.status.get())
-            stop_wait = asyncio.ensure_future(self._stop_event.wait())
+            while True:
+                q, item = _select_get(self.input, self.status, stop_event=self._stop_event)
 
-            try:
-                while True:
-                    done, _pending = await asyncio.wait(
-                        {input_get, status_get, stop_wait},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
+                if q is None:
+                    return
 
-                    if stop_wait in done:
+                if q is self.input:
+                    msg: RuntimeMessage = item
+                    if msg.channel == CONTROL_ADD_CHANNEL:
+                        self._handle_add(msg.payload)
+                    elif msg.channel == CONTROL_SHUTDOWN_CHANNEL:
+                        self._handle_shutdown(msg.payload)
                         return
+                    else:
+                        self._handle_publish(msg.channel, msg.payload)
 
-                    if input_get in done:
-                        msg = input_get.result()
-                        input_get = asyncio.ensure_future(self.input.get())
+                elif q is self.status:
+                    stopped: SubscriptionStopped = item
+                    sub = self._subscriptions.pop(stopped.channel, None)
+                    if sub is not None:
+                        sub.thread.join(timeout=REDIS_OPERATION_TIMEOUT)
 
-                        if msg.channel == CONTROL_ADD_CHANNEL:
-                            self._handle_add(msg.payload)
-                        elif msg.channel == CONTROL_SHUTDOWN_CHANNEL:
-                            self._handle_shutdown(msg.payload)
-                            return
-                        else:
-                            await self._handle_publish(msg.channel, msg.payload)
-
-                    if status_get in done:
-                        stopped = status_get.result()
-                        status_get = asyncio.ensure_future(self.status.get())
-
-                        sub = self._subscriptions.pop(stopped.channel, None)
-                        if sub is not None:
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await sub.task
-
-                        # Self-healing restart, mirroring run()'s status
-                        # handling: only while not shutting down, and never
-                        # for the two control channels (their failure at
-                        # bootstrap is treated as fatal above instead).
-                        if (
-                            not self._stop_event.is_set()
-                            and stopped.channel not in _CONTROL_CHANNELS
-                        ):
-                            logger.warning(
-                                "subscription %s terminated unexpectedly; restarting",
-                                stopped.channel,
-                            )
-                            self._start_subscription(stopped.channel)
-            finally:
-                for fut in (input_get, status_get, stop_wait):
-                    if not fut.done():
-                        fut.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await fut
+                    if (
+                        not self._stop_event.is_set()
+                        and stopped.channel not in _CONTROL_CHANNELS
+                    ):
+                        logger.warning(
+                            "subscription %s terminated unexpectedly; restarting",
+                            stopped.channel,
+                        )
+                        self._start_subscription(stopped.channel)
         finally:
-            await self._stop_all()
+            self._stop_all()
 
-    async def _bootstrap(self) -> None:
+    def _bootstrap(self) -> None:
         raw = os.environ.get("REDIS_DEFAULT_SUBSCRIPTIONS")
         if not raw:
             return
@@ -350,7 +332,7 @@ class Runtime:
                 logger.error("control:shutdown payload is not valid JSON: %r", payload)
         logger.info("runtime shutting down: reason=%r", reason)
 
-    async def _handle_publish(self, channel: str, payload: str) -> None:
+    def _handle_publish(self, channel: str, payload: str) -> None:
         if not payload or payload == "{}":
             return
         try:
@@ -366,91 +348,135 @@ class Runtime:
         if not req.channel:
             req.channel = channel
 
-        put = asyncio.ensure_future(self.events.put(req))
-        stop_wait = asyncio.ensure_future(self._stop_event.wait())
-        winner, _ = await _select2(put, stop_wait)
-        if winner == 1:
-            # Runtime is shutting down; drop the message rather than block
-            # forever waiting for room in `events`, matching handlePublish's
-            # `select { case rt.events <- ...: case <-rt.ctx.Done(): }`.
-            return
+        # select { case rt.events <- req: case <-rt.ctx.Done(): } --
+        # don't block forever waiting for room in `events` if the
+        # runtime is shutting down; drop the message instead.
+        while not self._stop_event.is_set():
+            try:
+                self.events.put(req, timeout=POLL_INTERVAL)
+                return
+            except queue.Full:
+                continue
 
     # -- subscription lifecycle ----------------------------------------------
 
     def _start_subscription(self, channel: str) -> None:
         if channel in self._subscriptions:
             return
-        task = asyncio.create_task(self._subscription_worker(channel))
-        self._subscriptions[channel] = Subscription(channel=channel, task=task)
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._subscription_worker,
+            args=(channel, stop_event),
+            name=f"pylogma-sub-{channel}",
+            daemon=True,
+        )
+        self._subscriptions[channel] = Subscription(channel=channel, thread=thread, stop_event=stop_event)
+        thread.start()
 
-    async def _stop_all(self) -> None:
+    def _stop_all(self) -> None:
         subs = list(self._subscriptions.values())
         for sub in subs:
-            sub.task.cancel()
+            sub.stop_event.set()
         for sub in subs:
-            with contextlib.suppress(asyncio.CancelledError):
-                await sub.task
+            sub.thread.join(timeout=REDIS_OPERATION_TIMEOUT)
         self._subscriptions.clear()
 
-    async def _subscription_worker(self, channel: str) -> None:
+    def _subscription_worker(self, channel: str, stop_event: threading.Event) -> None:
         """Analogous to Go's subscriptionWorker: (re)subscribes with
         exponential backoff on error, and forwards every message it
-        receives onto self.input until cancelled.
+        receives onto self.input until stop_event fires.
+
+        Uses `pubsub.get_message(timeout=...)` rather than
+        `pubsub.listen()` (which blocks indefinitely on the socket) so
+        this thread wakes up on its own, at POLL_INTERVAL cadence, to
+        check stop_event -- the sync equivalent of the asyncio branch's
+        `select { case <-pubsub.Channel(): case <-ctx.Done(): }`. This
+        also means the PubSub object is only ever touched by the thread
+        that owns it: no other thread calls .close() on it, which
+        avoids racing an in-flight socket read against connection
+        teardown.
         """
         delay = RECONNECT_MIN_DELAY
         try:
-            while True:
+            while not stop_event.is_set():
                 pubsub = self.client.pubsub()
                 try:
-                    async with asyncio.timeout(REDIS_OPERATION_TIMEOUT):
-                        await pubsub.subscribe(channel)
-                except (RedisError, TimeoutError, asyncio.TimeoutError) as exc:
-                    await pubsub.aclose()
-                    logger.warning("subscribe(%s) failed: %s; retrying in %.1fs", channel, exc, delay)
-                    await asyncio.sleep(delay)
+                    pubsub.subscribe(channel)
+                except RedisError as exc:
+                    pubsub.close()
+                    logger.warning(
+                        "subscribe(%s) failed: %s; retrying in %.1fs", channel, exc, delay
+                    )
+                    if stop_event.wait(timeout=delay):
+                        return
                     delay = min(delay * 2, RECONNECT_MAX_DELAY)
                     continue
 
                 delay = RECONNECT_MIN_DELAY
                 try:
-                    async for message in pubsub.listen():
-                        if message["type"] != "message":
+                    while not stop_event.is_set():
+                        try:
+                            message = pubsub.get_message(
+                                ignore_subscribe_messages=True, timeout=POLL_INTERVAL
+                            )
+                        except RedisError as exc:
+                            if not stop_event.is_set():
+                                logger.warning(
+                                    "get_message(%s) failed: %s; reconnecting", channel, exc
+                                )
+                            break
+                        if message is None:
                             continue
                         data = message["data"]
                         if isinstance(data, bytes):
                             data = data.decode("utf-8", errors="replace")
-                        await self.input.put(RuntimeMessage(channel=channel, payload=data))
+                        while not stop_event.is_set():
+                            try:
+                                self.input.put(
+                                    RuntimeMessage(channel=channel, payload=data),
+                                    timeout=POLL_INTERVAL,
+                                )
+                                break
+                            except queue.Full:
+                                continue
                 finally:
-                    await pubsub.aclose()
-        except asyncio.CancelledError:
-            raise
+                    pubsub.close()
+
+                if stop_event.is_set():
+                    return
+                # get_message() broke out of its loop due to a RedisError
+                # rather than stop_event -- the connection was lost;
+                # reconnect after a short backoff, mirroring the Go
+                # worker's outer retry loop.
+                if stop_event.wait(timeout=RECONNECT_MIN_DELAY):
+                    return
         finally:
-            with contextlib.suppress(asyncio.QueueFull):
+            try:
                 self.status.put_nowait(SubscriptionStopped(channel=channel))
+            except queue.Full:
+                logger.error("status queue full; dropped stop notice for %s", channel)
 
 
 class RuntimeHolder:
     """Mints one Runtime per session and hands it to whichever request
-    claims it, mirroring Go's runtimeHolder. A container instance lives
-    across many sequential requests (a warm instance is reused between
-    invocations), but each request's runtime is single-use: once a
-    session's Runtime finishes, the next request gets a fresh one rather
-    than being permanently locked out.
-
-    An external `maxInstanceRequestConcurrency=1` (Cloud Run/Cloud
-    Functions Gen 2) is what guarantees only one request -- and therefore
-    only one live Runtime -- exists at a time; no lock is needed here
-    because asyncio is single-threaded and claim() never awaits.
+    claims it, mirroring Go's runtimeHolder and this repo's asyncio
+    branch. Unlike the asyncio branch, this one genuinely needs a lock:
+    a Flask/gunicorn worker process can serve overlapping requests on
+    separate threads, and this module-level holder is constructed once
+    at cold start and reused across every warm invocation.
     """
 
     def __init__(self) -> None:
         self._runtime: Optional[Runtime] = None
+        self._lock = threading.Lock()
 
     def claim(self) -> Optional[Runtime]:
-        if self._runtime is None or self._runtime.state == RuntimeState.DONE:
-            self._runtime = Runtime()
-        if self._runtime.claim():
-            return self._runtime
+        with self._lock:
+            if self._runtime is None or self._runtime.state == RuntimeState.DONE:
+                self._runtime = Runtime()
+            rt = self._runtime
+        if rt.claim():
+            return rt
         return None
 
 

@@ -1,15 +1,20 @@
-"""Entrypoint for local/uvicorn and Cloud Run/Cloud Functions Gen 2 deploys.
+"""Gen 1 Cloud Function entry point, matching pyspace-minimal's own
+root main.py exactly.
 
-Run locally:
-    uvicorn main:app --host 0.0.0.0 --port 8080
+Deploy with:
+    gcloud functions deploy pylogma-serverless \
+        --no-gen2 \
+        --runtime python312 \
+        --entry-point main \
+        --trigger-http \
+        --set-env-vars ROUTER_MODULE=router,REDIS_URI=...,API_KEY=...
 
-Cloud Run deploy note: set --concurrency=1 (the Python equivalent of the Go
-version's maxInstanceRequestConcurrency=1) so exactly one HTTP request --
-and therefore exactly one live Runtime -- is ever in flight per container
-instance. Cloud Functions Gen 2 runs on Cloud Run under the hood and takes
-the same setting.
+See README.md for the full env var list and local run instructions.
 """
 
-from pylogma_serverless.app import app
+from os import path
 
-__all__ = ["app"]
+from cloud_function_app import CloudFunctionApp
+
+app = CloudFunctionApp(root=path.dirname(path.abspath(__file__)))
+main = app.build()
