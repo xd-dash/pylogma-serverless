@@ -8,14 +8,20 @@ Gen 1**, dispatched through [dash-xd/pyspace-minimal](https://github.com/dash-xd
 a `ROUTER_MODULE`).
 
 **This repo is a router payload, not a deployable Cloud Function on its
-own.** pyspace-minimal's README documents the pattern: a router repo is a
-pip-installable package that some other *deploy-shell* repo depends on
-(via a `git+https://...` line in that repo's `requirements.txt`, plus a
-`ROUTER_MODULE` env var on the Cloud Function pointing at it) --
-pyspace-minimal's own `main.py` (`CloudFunctionApp(...).build()`) is what
-actually gets deployed as the entry point, in that other repo. This repo
-never instantiates `CloudFunctionApp` itself; see "Installation" and
-"Deploying" below.
+own -- it never has, and never will, contain a `main.py`.** There are two
+repos in this picture:
+
+1. **This repo** -- just the router payload: `pylogma_serverless/router.py`
+   (route registration) + `pylogma_serverless/runtime.py` (the Redis
+   actor). Pip-installable (`pyproject.toml`), nothing more.
+2. **A separate deploy-shell repo** (e.g. `xd-dash/huram-abi`) -- composes
+   pyspace-minimal + this package together for real: it owns the actual
+   `main.py` (`CloudFunctionApp(...).build()`), the actual
+   `requirements.txt` (with a `pylogma-serverless @ git+https://...` line
+   pulling this repo in), the `ROUTER_MODULE=pylogma_serverless.router`
+   env var, and the actual `gcloud functions deploy` call. That repo is
+   out of scope here; see "Installation" and "Deploying" below for how
+   the two connect.
 
 > This repo also has an async/Starlette/SSE branch,
 > `claude/pylogma-serverless-async-zmr63w`, targeting Cloud Run / Cloud
@@ -52,13 +58,13 @@ pylogma_serverless/
                                      POST /run directly on the shared Flask app (see its
                                      docstring for why pyspace-minimal's declarative ROUTES
                                      dict alone isn't enough here)
-dev/main.py                      -- local-dev-only harness, NOT deployed; mirrors
-                                     pyspace-minimal's own root main.py so you can run
-                                     functions-framework against this repo without a
-                                     separate deploy-shell repo checked out
 tests/                            -- unit tests for the control-message handlers and the
                                      claim()/RuntimeHolder state machine
 ```
+
+No `main.py` anywhere in this repo, on purpose -- see "Running locally"
+below for how to exercise this package against a real Cloud Function
+entry point without one.
 
 ## Design mapping (Go / async branch -> this branch)
 
@@ -244,20 +250,47 @@ env var on that deploy-shell.
 
 Requires Python 3.12 (pyspace-minimal's `cloud_function_app` package
 pins `requires-python = ">=3.12"`, and it's also the Gen 1 deploy
-runtime this branch targets). `dev/main.py` is a local stand-in for the
-deploy-shell described above, so you can run this repo end-to-end
-without checking out a separate one.
+runtime this branch targets). Two separate things you might want to run:
+
+### Unit tests
+
+Just this repo, no Flask/HTTP/pyspace-minimal involved:
 
 ```bash
 python3.12 -m venv .venv && . .venv/bin/activate
-pip install -r requirements-dev.txt   # editable-installs this package (pyproject.toml)
-                                       # plus functions-framework + pyspace-minimal, for dev/main.py
+pip install -r requirements-dev.txt
+pytest tests/ -v
+```
+
+Covers `_handle_publish`'s channel-default-override and empty/`{}`-payload
+drop, `_handle_add`'s dedup/validation, and `claim()`/`RuntimeHolder`'s
+compare-and-swap state machine -- ported from the Go version's
+`runtime_test.go` cases, adapted to synchronous calls (no
+`pytest-asyncio` needed on this branch). These don't require a running
+Redis server since `Runtime`'s constructor is lazy about connecting.
+
+### Manual integration smoke test
+
+This exercises the actual `POST /run` route through `functions-framework`,
+the way it'll really run once deployed. Since this repo intentionally has
+no `main.py` (see above), and `cloud-function-app`'s pip package only
+ships the `CloudFunctionApp` library code -- not the runnable root
+`main.py` example -- you need a real pyspace-minimal checkout on disk to
+point `functions-framework --source=` at. This is exactly what a real
+deploy-shell repo gives you; here we just use a throwaway local clone
+standing in for it:
+
+```bash
+git clone https://github.com/dash-xd/pyspace-minimal /tmp/pyspace-minimal
+
+pip install -r requirements-dev.txt   # editable-installs this package + functions-framework
+                                       # + cloud-function-app (pyspace-minimal's library)
 
 export API_KEY=dev-key
 export REDIS_URI=redis://localhost:6379
 export ROUTER_MODULE=pylogma_serverless.router
 
-functions-framework --target=main --source=dev/main.py --port 8080
+functions-framework --target=main --source=/tmp/pyspace-minimal/main.py --port 8080
 ```
 
 ```bash
@@ -271,20 +304,6 @@ redis-cli publish control:shutdown '{"reason":"done"}'
 # the first curl now returns {"status": "stopped"}
 ```
 
-## Tests
-
-```bash
-pip install -r requirements-dev.txt
-pytest tests/ -v
-```
-
-Covers `_handle_publish`'s channel-default-override and empty/`{}`-payload
-drop, `_handle_add`'s dedup/validation, and `claim()`/`RuntimeHolder`'s
-compare-and-swap state machine -- ported from the Go version's
-`runtime_test.go` cases, adapted to synchronous calls (no
-`pytest-asyncio` needed on this branch). These don't require a running
-Redis server since `Runtime`'s constructor is lazy about connecting.
-
 ## Deploying
 
 Deployment does not happen from this repo -- there's no `main.py` here to
@@ -294,7 +313,7 @@ dependency and supplies pyspace-minimal's own `main.py`. From that
 repo:
 
 ```bash
-gcloud functions deploy pylogma-serverless \
+gcloud functions deploy <function-name> \
   --no-gen2 \
   --runtime python312 \
   --entry-point main \
@@ -303,6 +322,9 @@ gcloud functions deploy pylogma-serverless \
 ```
 
 `--no-gen2` forces Gen 1, matching pyspace-minimal's own README.
+`<function-name>` and everything else about this command belongs to the
+deploy-shell repo (e.g. `xd-dash/huram-abi`) -- this repo has no opinion
+on it.
 
 ## Known gaps vs. the Go version / the async branch
 
