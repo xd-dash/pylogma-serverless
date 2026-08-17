@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pylogma-serverless"
+version = "0.1.0"
+description = "Router payload for the pylogma Redis Pub/Sub Cloud Function (Gen 1), consumed via pyspace-minimal's ROUTER_MODULE mechanism."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flask",
+    "redis",
+]
+
+# Deliberately a flat layout (pylogma_serverless/ at repo root) rather
+# than pyspace-minimal's own src/ convention: this package has a single
+# module directory with no import-shadowing risk, so moving it under
+# src/ would be pure churn with no functional benefit here.
+[tool.hatch.build.targets.wheel]
+packages = ["pylogma_serverless"]

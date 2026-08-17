@@ -2,9 +2,8 @@
 `runHandler` (there is no `/events` on this branch -- see runtime.py's
 module docstring for why).
 
-These are plain `(body, status)`-returning view functions, the shape
-pyspace-minimal's `CloudFunctionApp.register_routes()` expects for a
-`ROUTES = {url_rule: view_func}` entry (see router.py).
+Registered onto the shared Flask app by router.py, which is the sole
+owner of route registration/ROUTES for this package.
 """
 
 from __future__ import annotations
@@ -57,8 +56,3 @@ def run_view():
     rt.start()
 
     return jsonify({"status": "stopped"})
-
-
-ROUTES = {
-    "/run": run_view,
-}

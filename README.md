@@ -7,6 +7,16 @@ Gen 1**, dispatched through [dash-xd/pyspace-minimal](https://github.com/dash-xd
 `CloudFunctionApp` (Flask + `functions-framework`, routes hot-loaded from
 a `ROUTER_MODULE`).
 
+**This repo is a router payload, not a deployable Cloud Function on its
+own.** pyspace-minimal's README documents the pattern: a router repo is a
+pip-installable package that some other *deploy-shell* repo depends on
+(via a `git+https://...` line in that repo's `requirements.txt`, plus a
+`ROUTER_MODULE` env var on the Cloud Function pointing at it) --
+pyspace-minimal's own `main.py` (`CloudFunctionApp(...).build()`) is what
+actually gets deployed as the entry point, in that other repo. This repo
+never instantiates `CloudFunctionApp` itself; see "Installation" and
+"Deploying" below.
+
 > This repo also has an async/Starlette/SSE branch,
 > `claude/pylogma-serverless-async-zmr63w`, targeting Cloud Run / Cloud
 > Functions **Gen 2**. Read the next section before picking a branch --
@@ -33,14 +43,19 @@ branch instead.
 ## Layout
 
 ```
-main.py                          -- Gen 1 entrypoint: CloudFunctionApp(...).build() -> `main`
-router.py                        -- ROUTER_MODULE target; registers POST /run directly
-                                     on the shared Flask app (see its docstring for why
-                                     pyspace-minimal's declarative ROUTES dict alone isn't
-                                     enough here)
+pyproject.toml                   -- makes this pip-installable (name: pylogma-serverless);
+                                     runtime deps are just flask + redis
 pylogma_serverless/
   runtime.py                     -- the Runtime actor (threaded rewrite of the Go/async version)
   views.py                       -- run_view() (Flask view function) + X-API-Key auth check
+  router.py                      -- ROUTER_MODULE target (pylogma_serverless.router); registers
+                                     POST /run directly on the shared Flask app (see its
+                                     docstring for why pyspace-minimal's declarative ROUTES
+                                     dict alone isn't enough here)
+dev/main.py                      -- local-dev-only harness, NOT deployed; mirrors
+                                     pyspace-minimal's own root main.py so you can run
+                                     functions-framework against this repo without a
+                                     separate deploy-shell repo checked out
 tests/                            -- unit tests for the control-message handlers and the
                                      claim()/RuntimeHolder state machine
 ```
@@ -178,7 +193,7 @@ Same JSON shapes as the Go version and the async branch:
 | `REDISCLI_AUTH`                 | Redis password (optional)                                    |
 | `REDIS_DEFAULT_SUBSCRIPTIONS`   | JSON array of channel names to subscribe at boot, e.g. `["a","b"]` |
 | `API_KEY`                       | Required; requests must send a matching `X-API-Key` header, compared in constant time |
-| `ROUTER_MODULE`                 | Required by pyspace-minimal's `CloudFunctionApp`; set to `router` so it imports this repo's `router.py` |
+| `ROUTER_MODULE`                 | Set by the *deploy-shell* repo's `CloudFunctionApp` config to `pylogma_serverless.router` so it imports this package's `router.py`. Not something this repo sets on itself. |
 
 Constants (`pylogma_serverless/runtime.py`), identical values to the Go
 `const` block and the async branch:
@@ -206,25 +221,43 @@ Registered directly on the shared Flask app rather than through
 pyspace-minimal's `ROUTES` dict, because `CloudFunctionApp.register_routes()`
 calls `add_url_rule(rule, endpoint=rule, view_func=view_func)` without a
 `methods=` argument, defaulting to GET/HEAD/OPTIONS only -- see
-`router.py`'s docstring for the full explanation. No `/` health-check
-route, matching the Go version's reasoning about not wasting the
-container's request-handling slot.
+`pylogma_serverless/router.py`'s docstring for the full explanation. No
+`/` health-check route, matching the Go version's reasoning about not
+wasting the container's request-handling slot.
+
+## Installation
+
+This is a router payload, installed by whatever deploy-shell repo runs
+pyspace-minimal's `CloudFunctionApp` in production -- add a line like
+this to *that* repo's `requirements.txt` (pyspace-minimal's own
+`.github/actions/router` composite action automates exactly this append
+from CI):
+
+```
+pylogma-serverless @ git+https://github.com/xd-dash/pylogma-serverless.git@claude/pylogma-serverless-gen1
+```
+
+then set `ROUTER_MODULE=pylogma_serverless.router` as a Cloud Function
+env var on that deploy-shell.
 
 ## Running locally
 
 Requires Python 3.12 (pyspace-minimal's `cloud_function_app` package
 pins `requires-python = ">=3.12"`, and it's also the Gen 1 deploy
-runtime this branch targets).
+runtime this branch targets). `dev/main.py` is a local stand-in for the
+deploy-shell described above, so you can run this repo end-to-end
+without checking out a separate one.
 
 ```bash
 python3.12 -m venv .venv && . .venv/bin/activate
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt   # editable-installs this package (pyproject.toml)
+                                       # plus functions-framework + pyspace-minimal, for dev/main.py
 
 export API_KEY=dev-key
 export REDIS_URI=redis://localhost:6379
-export ROUTER_MODULE=router
+export ROUTER_MODULE=pylogma_serverless.router
 
-functions-framework --target=main --source=main.py --port 8080
+functions-framework --target=main --source=dev/main.py --port 8080
 ```
 
 ```bash
@@ -254,19 +287,22 @@ Redis server since `Runtime`'s constructor is lazy about connecting.
 
 ## Deploying
 
+Deployment does not happen from this repo -- there's no `main.py` here to
+point `--entry-point` at (see "Installation" above for why). It happens
+from whatever deploy-shell repo installs `pylogma-serverless` as a
+dependency and supplies pyspace-minimal's own `main.py`. From that
+repo:
+
 ```bash
 gcloud functions deploy pylogma-serverless \
   --no-gen2 \
   --runtime python312 \
   --entry-point main \
   --trigger-http \
-  --set-env-vars ROUTER_MODULE=router,REDIS_URI=...,REDISCLI_AUTH=...,API_KEY=...
+  --set-env-vars ROUTER_MODULE=pylogma_serverless.router,REDIS_URI=...,REDISCLI_AUTH=...,API_KEY=...
 ```
 
-`--no-gen2` forces Gen 1, matching pyspace-minimal's own README. The
-deployed source directory needs `main.py`, `router.py`,
-`pylogma_serverless/`, and `requirements.txt` together -- pip can't reach
-into a separately-deployed package.
+`--no-gen2` forces Gen 1, matching pyspace-minimal's own README.
 
 ## Known gaps vs. the Go version / the async branch
 

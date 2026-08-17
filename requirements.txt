@@ -1,3 +1,0 @@
-functions-framework>=3.9,<4
-redis>=5.0,<6.0
-cloud-function-app @ git+https://github.com/dash-xd/pyspace-minimal
