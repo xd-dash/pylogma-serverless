@@ -54,20 +54,23 @@ jobs:
         working-directory: redis-src
         run: |
           set -eu
-          # Bundled deps (hiredis, lua, xxhash, tre, ...) are only built as a
-          # side effect of an `all` target, not as prerequisites of the
-          # `redis-server`/`redis-cli` targets themselves. So do a normal
-          # full build first (deps + everything, dynamically linked) - this
-          # also builds tests/modules/*.so, which is fine since nothing is
-          # static yet.
+          # Bundled deps (hiredis, lua, xxhash, tre, ...) are only built by the
+          # ROOT Makefile's `all`/`build` recipe (it builds deps, then `cd src
+          # && make all`) - src/Makefile's own `all` does NOT build them on
+          # its own, so scoping to `make -C src all` skips deps entirely and
+          # fails on whichever `.a` it needs first. So this has to go through
+          # the root `all`.
           #
-          # Deliberately `make -C src all`, not the root-level `make all`:
-          # the root Makefile's `all`/`build` target also tries to build the
-          # bundled Redis Stack extension modules under modules/ (redisbloom,
+          # The root `all`/`build` recipe also tries to build the bundled
+          # Redis Stack extension modules under modules/ (redisbloom,
           # redisearch, redisjson, redistimeseries), which need their own
-          # `readies` build tooling we don't have and don't need. src/Makefile's
-          # own `all` builds deps + the core binaries without touching those.
-          make -C src -j"$(nproc)" MALLOC=libc BUILD_TLS=no all
+          # `readies` build tooling we don't have and don't need - that step
+          # fails and makes the overall command exit non-zero, but by then
+          # deps + redis-server + redis-cli are already built successfully.
+          # So tolerate this command's exit code and verify the actual
+          # binary we need instead.
+          make -j"$(nproc)" MALLOC=libc BUILD_TLS=no all || true
+          test -f src/redis-server
 
           # Now force a static re-link of just the two binaries we need. All
           # deps and object files already exist at this point, so this only
