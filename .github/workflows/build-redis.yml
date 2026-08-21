@@ -1,0 +1,90 @@
+name: Build portable Redis binaries
+
+# Produces a statically-linked (musl) redis-server + redis-cli that can be
+# dropped into any Linux machine's $HOME (e.g. ~/.local/redis) and run
+# without root, a package manager, or a compiler present at runtime.
+#
+# Rationale: build once on a throwaway musl (Alpine) environment, ship the
+# resulting binaries as a workflow artifact. A static musl build avoids the
+# glibc-version compatibility problems a dynamically linked binary built on
+# one distro can hit when run on an older one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      redis_version:
+        description: 'Redis version to build (e.g. "7.4.2"), or "stable" for the latest stable release'
+        required: false
+        default: 'stable'
+  workflow_call:
+    inputs:
+      redis_version:
+        description: 'Redis version to build (e.g. "7.4.2"), or "stable" for the latest stable release'
+        required: false
+        default: 'stable'
+        type: string
+
+jobs:
+  build-static-redis:
+    name: Build static redis-server (musl)
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+
+    steps:
+      - name: Install build dependencies
+        run: apk add --no-cache build-base linux-headers wget tar
+
+      - name: Download Redis source
+        env:
+          REDIS_VERSION: ${{ inputs.redis_version || 'stable' }}
+        run: |
+          set -eu
+          if [ "$REDIS_VERSION" = "stable" ]; then
+            url="https://download.redis.io/redis-stable.tar.gz"
+          else
+            url="https://download.redis.io/releases/redis-${REDIS_VERSION}.tar.gz"
+          fi
+          echo "Downloading $url"
+          wget -O redis.tar.gz "$url"
+          mkdir -p redis-src
+          tar -xzf redis.tar.gz --strip-components=1 -C redis-src
+
+      - name: Build static binaries
+        working-directory: redis-src
+        run: |
+          set -eu
+          make -j"$(nproc)" MALLOC=libc BUILD_TLS=no LDFLAGS="-static"
+
+      - name: Verify static linking
+        working-directory: redis-src/src
+        run: |
+          set -eu
+          file redis-server redis-cli
+          # A truly static binary reports "not a dynamic executable".
+          ldd redis-server 2>&1 | grep -q "not a dynamic executable"
+          ldd redis-cli 2>&1 | grep -q "not a dynamic executable"
+
+      - name: Smoke test
+        working-directory: redis-src/src
+        run: |
+          set -eu
+          ./redis-server --port 16379 --daemonize no &
+          server_pid=$!
+          sleep 1
+          ./redis-cli -p 16379 ping
+          kill "$server_pid"
+
+      - name: Stage binaries
+        run: |
+          set -eu
+          mkdir -p dist
+          cp redis-src/src/redis-server dist/
+          cp redis-src/src/redis-cli dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-static-musl-linux-x86_64
+          path: dist/
+          retention-days: 90
