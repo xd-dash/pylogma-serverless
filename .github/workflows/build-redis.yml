@@ -77,6 +77,18 @@ jobs:
             's|^\(\t\)-(cd \.\./deps \&\& \$(MAKE) \$(DEPENDENCY_TARGETS)|\1(cd ../deps \&\& $(MAKE) $(DEPENDENCY_TARGETS)|' \
             src/Makefile
 
+          # xxhash's default `lib` target (deps/Makefile) builds BOTH
+          # libxxhash.a (static) and libxxhash.so (shared) - and our
+          # LDFLAGS=-static leaks into that recursive sub-make and breaks the
+          # shared-object half (ld: "can not be used when making a shared
+          # object"), the same -static/-shared conflict as tests/modules, one
+          # dependency deeper. We only need the static libxxhash.a that
+          # src/Makefile links against, so build that specific target instead
+          # of the combined `lib`.
+          sed -i \
+            's|cd xxhash \&\& \$(MAKE) lib CFLAGS=|cd xxhash \&\& $(MAKE) libxxhash.a CFLAGS=|' \
+            deps/Makefile
+
           # Target redis-server/redis-cli directly (not `all`) so this never
           # touches tests/modules (which would conflict with LDFLAGS=-static,
           # since those build as `.so`) or the bundled Redis Stack extension
