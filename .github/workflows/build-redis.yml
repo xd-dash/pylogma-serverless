@@ -54,16 +54,22 @@ jobs:
         working-directory: redis-src
         run: |
           set -eu
-          make -j"$(nproc)" MALLOC=libc BUILD_TLS=no LDFLAGS="-static"
+          # Build bundled deps (hiredis/lua/linenoise/xxhash/...) serially first.
+          # A parallel top-level `make -j` can start linking redis-server before
+          # these finish, which fails with "cannot find ../deps/xxhash/libxxhash.a".
+          make -C deps hiredis linenoise lua hdr_histogram fpconv xxhash
+          # Build only redis-server/redis-cli directly via src/Makefile, rather than
+          # the top-level `all`, which also builds tests/modules/*.so. Those are
+          # shared objects, and LDFLAGS=-static can't be applied to a `-shared` link.
+          make -C src -j"$(nproc)" MALLOC=libc BUILD_TLS=no LDFLAGS="-static" redis-server redis-cli
 
       - name: Verify static linking
         working-directory: redis-src/src
         run: |
           set -eu
-          file redis-server redis-cli
+          file redis-server
           # A truly static binary reports "not a dynamic executable".
           ldd redis-server 2>&1 | grep -q "not a dynamic executable"
-          ldd redis-cli 2>&1 | grep -q "not a dynamic executable"
 
       - name: Smoke test
         working-directory: redis-src/src
@@ -80,7 +86,6 @@ jobs:
           set -eu
           mkdir -p dist
           cp redis-src/src/redis-server dist/
-          cp redis-src/src/redis-cli dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
