@@ -55,12 +55,19 @@ jobs:
         run: |
           set -eu
           # Bundled deps (hiredis, lua, xxhash, tre, ...) are only built as a
-          # side effect of the top-level `all` target, not as prerequisites of
-          # the `redis-server`/`redis-cli` targets themselves. So do a normal
+          # side effect of an `all` target, not as prerequisites of the
+          # `redis-server`/`redis-cli` targets themselves. So do a normal
           # full build first (deps + everything, dynamically linked) - this
           # also builds tests/modules/*.so, which is fine since nothing is
           # static yet.
-          make -j"$(nproc)" MALLOC=libc BUILD_TLS=no all
+          #
+          # Deliberately `make -C src all`, not the root-level `make all`:
+          # the root Makefile's `all`/`build` target also tries to build the
+          # bundled Redis Stack extension modules under modules/ (redisbloom,
+          # redisearch, redisjson, redistimeseries), which need their own
+          # `readies` build tooling we don't have and don't need. src/Makefile's
+          # own `all` builds deps + the core binaries without touching those.
+          make -C src -j"$(nproc)" MALLOC=libc BUILD_TLS=no all
 
           # Now force a static re-link of just the two binaries we need. All
           # deps and object files already exist at this point, so this only
