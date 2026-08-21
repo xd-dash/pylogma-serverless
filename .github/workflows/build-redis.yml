@@ -69,7 +69,14 @@ jobs:
           # deps + redis-server + redis-cli are already built successfully.
           # So tolerate this command's exit code and verify the actual
           # binary we need instead.
-          make -j"$(nproc)" MALLOC=libc BUILD_TLS=no all || true
+          #
+          # Deliberately no -j here: this recipe builds deps via a recursive
+          # $(MAKE) before linking redis-server, and under -j the final link
+          # can race ahead of that sub-make finishing (seen intermittently as
+          # "cannot find ../deps/tre/libtre.a" - same command, same input,
+          # different outcome between runs). Running serially makes deps
+          # resolution deterministic.
+          make MALLOC=libc BUILD_TLS=no all || true
           test -f src/redis-server
 
           # Now force a static re-link of just the two binaries we need. All
