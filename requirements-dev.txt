@@ -1,0 +1,9 @@
+# Local development / testing only. Runtime dependencies (flask, redis)
+# come transitively from `-e .` (see pyproject.toml). functions-framework
+# and cloud-function-app are needed only to run dev/main.py locally, as a
+# stand-in for whatever real deploy-shell repo consumes this package in
+# production -- neither belongs in pyproject.toml's own dependencies.
+-e .
+functions-framework>=3.9,<4
+cloud-function-app @ git+https://github.com/dash-xd/pyspace-minimal
+pytest>=8.0,<9.0
