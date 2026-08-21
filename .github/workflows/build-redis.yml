@@ -67,10 +67,9 @@ jobs:
         working-directory: redis-src/src
         run: |
           set -eu
-          file redis-server redis-cli
+          file redis-server
           # A truly static binary reports "not a dynamic executable".
           ldd redis-server 2>&1 | grep -q "not a dynamic executable"
-          ldd redis-cli 2>&1 | grep -q "not a dynamic executable"
 
       - name: Smoke test
         working-directory: redis-src/src
@@ -87,7 +86,6 @@ jobs:
           set -eu
           mkdir -p dist
           cp redis-src/src/redis-server dist/
-          cp redis-src/src/redis-cli dist/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
