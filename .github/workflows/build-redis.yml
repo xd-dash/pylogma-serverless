@@ -54,6 +54,10 @@ jobs:
         working-directory: redis-src
         run: |
           set -eu
+          # Build bundled deps (hiredis/lua/linenoise/xxhash/...) serially first.
+          # A parallel top-level `make -j` can start linking redis-server before
+          # these finish, which fails with "cannot find ../deps/xxhash/libxxhash.a".
+          make -C deps hiredis linenoise lua hdr_histogram fpconv xxhash
           make -j"$(nproc)" MALLOC=libc BUILD_TLS=no LDFLAGS="-static"
 
       - name: Verify static linking
