@@ -54,37 +54,34 @@ jobs:
         working-directory: redis-src
         run: |
           set -eu
-          # Bundled deps (hiredis, lua, xxhash, tre, ...) are only built by the
-          # ROOT Makefile's `all`/`build` recipe (it builds deps, then `cd src
-          # && make all`) - src/Makefile's own `all` does NOT build them on
-          # its own, so scoping to `make -C src all` skips deps entirely and
-          # fails on whichever `.a` it needs first. So this has to go through
-          # the root `all`.
+          # src/Makefile records each invocation's FINAL_CFLAGS/FINAL_LDFLAGS
+          # in .make-settings, and re-runs `distclean` + a full deps rebuild
+          # (persist-settings, see src/Makefile) the moment those flags differ
+          # from the previous invocation's. A "build normally, then force a
+          # static re-link" two-phase approach changes LDFLAGS between the two
+          # make calls, so the second call wipes and rebuilds everything the
+          # first call already produced - including bundled deps
+          # (hiredis/lua/xxhash/tre/...) via a Makefile line that swallows
+          # that rebuild's exit code (a leading `-`), so a real failure in any
+          # one dep only surfaces later as a missing ../deps/<name>/lib*.a at
+          # final link. That's what caused the "cannot find ...libtre.a"
+          # failures seen here - not a -j race.
           #
-          # The root `all`/`build` recipe also tries to build the bundled
-          # Redis Stack extension modules under modules/ (redisbloom,
-          # redisearch, redisjson, redistimeseries), which need their own
-          # `readies` build tooling we don't have and don't need - that step
-          # fails and makes the overall command exit non-zero, but by then
-          # deps + redis-server + redis-cli are already built successfully.
-          # So tolerate this command's exit code and verify the actual
-          # binary we need instead.
-          #
-          # Deliberately no -j here: this recipe builds deps via a recursive
-          # $(MAKE) before linking redis-server, and under -j the final link
-          # can race ahead of that sub-make finishing (seen intermittently as
-          # "cannot find ../deps/tre/libtre.a" - same command, same input,
-          # different outcome between runs). Running serially makes deps
-          # resolution deterministic.
-          make MALLOC=libc BUILD_TLS=no all || true
-          test -f src/redis-server
+          # Fix: build with the final flags from the very start, in one
+          # invocation, so persist-settings only ever runs once (the
+          # unavoidable first-run trigger, since no .make-settings exists
+          # yet) - and un-swallow that one recipe line first, so if a dep
+          # genuinely fails to build, we see gcc/ld's real error instead of a
+          # downstream "missing .a".
+          sed -i \
+            's|^\(\t\)-(cd \.\./deps \&\& \$(MAKE) \$(DEPENDENCY_TARGETS)|\1(cd ../deps \&\& $(MAKE) $(DEPENDENCY_TARGETS)|' \
+            src/Makefile
 
-          # Now force a static re-link of just the two binaries we need. All
-          # deps and object files already exist at this point, so this only
-          # relinks - it doesn't touch tests/modules (avoiding the `-static`
-          # + `-shared` conflict from a bare `LDFLAGS=-static all`), and it
-          # doesn't need to rebuild any deps.
-          rm -f src/redis-server src/redis-cli
+          # Target redis-server/redis-cli directly (not `all`) so this never
+          # touches tests/modules (which would conflict with LDFLAGS=-static,
+          # since those build as `.so`) or the bundled Redis Stack extension
+          # modules under modules/ (which need readies tooling we don't have
+          # and don't need).
           make -C src MALLOC=libc BUILD_TLS=no LDFLAGS="-static" redis-server redis-cli
 
       - name: Verify static linking
